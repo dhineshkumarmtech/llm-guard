@@ -16,5 +16,5 @@ def test_health_endpoint() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "llm-guard",
-        "version": "0.1.0",
+        "version": "0.2.0",
     }
