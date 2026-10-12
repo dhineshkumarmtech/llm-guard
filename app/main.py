@@ -1,4 +1,6 @@
 """Main FastAPI application for LLM-Guard."""
+from fastapi import HTTPException
+from app.firewall.rules import inspect_prompt
 
 from time import perf_counter
 from typing import Any
@@ -63,6 +65,25 @@ def health_check() -> dict[str, str]:
 
 
 @app.post("/proxy")
-def proxy_prompt(request: ProxyRequest) -> dict[str, Any]:
-    """Forward a prompt to the mock LLM backend."""
-    return forward_prompt(request.prompt)
+def proxy_prompt(
+    payload: ProxyRequest,
+    http_request: Request,
+) -> dict[str, Any]:
+    """Inspect an incoming prompt before forwarding it."""
+    matches = inspect_prompt(payload.prompt)
+
+    if matches:
+        log_event(
+            "prompt_blocked",
+            request_id=http_request.state.request_id,
+            matched_rules=matches,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "Prompt blocked by LLM-Guard",
+                "matched_rules": matches,
+            },
+        )
+
+    return forward_prompt(payload.prompt)
