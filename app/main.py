@@ -13,6 +13,10 @@ from app.config import settings
 from app.logger import log_event
 from app.proxy import forward_prompt
 
+from app.dlp.detectors import (
+    inspect_sensitive_data,
+    redact_sensitive_data,
+)
 
 app = FastAPI(
     title="LLM-Guard",
@@ -63,19 +67,21 @@ def health_check() -> dict[str, str]:
         "version": "0.3.0",
     }
 
-
 @app.post("/proxy")
 def proxy_prompt(
     payload: ProxyRequest,
     http_request: Request,
 ) -> dict[str, Any]:
-    """Inspect an incoming prompt before forwarding it."""
+    """Apply injection rules and DLP before forwarding a prompt."""
+    request_id = http_request.state.request_id
+
+    # Block prompt injection and jailbreak attempts first.
     matches = inspect_prompt(payload.prompt)
 
     if matches:
         log_event(
             "prompt_blocked",
-            request_id=http_request.state.request_id,
+            request_id=request_id,
             matched_rules=matches,
         )
         raise HTTPException(
@@ -86,4 +92,28 @@ def proxy_prompt(
             },
         )
 
-    return forward_prompt(payload.prompt)
+    # Detect sensitive data without logging its actual values.
+    findings = inspect_sensitive_data(payload.prompt)
+    prompt_to_forward = payload.prompt
+
+    if findings:
+        log_event(
+            "dlp_detected",
+            request_id=request_id,
+            mode=settings.mode,
+            findings=findings,
+        )
+
+        if settings.mode == "block":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "Prompt blocked by DLP",
+                    "findings": findings,
+                },
+            )
+
+        if settings.mode == "redact":
+            prompt_to_forward = redact_sensitive_data(payload.prompt)
+
+    return forward_prompt(prompt_to_forward)
