@@ -12,6 +12,7 @@ from app.dlp.detectors import (
     inspect_sensitive_data,
     redact_sensitive_data,
 )
+from app.firewall.ml import classify_prompt, is_suspicious
 from app.firewall.rules import inspect_prompt
 from app.logger import log_event
 from app.output_guard import inspect_output, redact_output
@@ -73,10 +74,10 @@ def proxy_prompt(
     payload: ProxyRequest,
     http_request: Request,
 ) -> dict[str, Any]:
-    """Inspect input and output around the mock LLM."""
+    """Inspect prompts and responses using layered security checks."""
     request_id = http_request.state.request_id
 
-    # Stage 1: block prompt injection and jailbreak attempts.
+    # Stage 1: apply the existing deterministic firewall rules.
     matches = inspect_prompt(payload.prompt)
 
     if matches:
@@ -93,7 +94,28 @@ def proxy_prompt(
             },
         )
 
-    # Stage 2: inspect sensitive data in the incoming prompt.
+    # Stage 2: apply the ML classifier to less obvious attack patterns.
+    ml_result = classify_prompt(payload.prompt)
+    threshold = settings.risk_threshold
+
+    if is_suspicious(payload.prompt, threshold):
+        log_event(
+            "ml_prompt_blocked",
+            request_id=request_id,
+            predicted_label=ml_result["label"],
+            malicious_probability=ml_result["malicious_probability"],
+            threshold=threshold,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "Prompt blocked by ML classifier",
+                "classification": ml_result,
+                "threshold": threshold,
+            },
+        )
+
+    # Stage 3: inspect sensitive data in the incoming prompt.
     input_findings = inspect_sensitive_data(payload.prompt)
     prompt_to_forward = payload.prompt
 
@@ -118,12 +140,11 @@ def proxy_prompt(
         if settings.mode == "redact":
             prompt_to_forward = redact_sensitive_data(payload.prompt)
 
-    # Stage 3: send the inspected prompt to the mock LLM.
+    # Stage 4: forward accepted input to the mock LLM.
     result = forward_prompt(prompt_to_forward)
-
-    # Stage 4: inspect the LLM response before returning it.
     response_text = result.get("response")
 
+    # Stage 5: inspect the LLM response before returning it.
     if isinstance(response_text, str):
         output_findings = inspect_output(response_text)
 
