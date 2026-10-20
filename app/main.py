@@ -1,22 +1,22 @@
 """Main FastAPI application for LLM-Guard."""
-from fastapi import HTTPException
-from app.firewall.rules import inspect_prompt
 
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from app.config import settings
-from app.logger import log_event
-from app.proxy import forward_prompt
-
 from app.dlp.detectors import (
     inspect_sensitive_data,
     redact_sensitive_data,
 )
+from app.firewall.rules import inspect_prompt
+from app.logger import log_event
+from app.output_guard import inspect_output, redact_output
+from app.proxy import forward_prompt
+
 
 app = FastAPI(
     title="LLM-Guard",
@@ -67,15 +67,16 @@ def health_check() -> dict[str, str]:
         "version": "0.3.0",
     }
 
+
 @app.post("/proxy")
 def proxy_prompt(
     payload: ProxyRequest,
     http_request: Request,
 ) -> dict[str, Any]:
-    """Apply injection rules and DLP before forwarding a prompt."""
+    """Inspect input and output around the mock LLM."""
     request_id = http_request.state.request_id
 
-    # Block prompt injection and jailbreak attempts first.
+    # Stage 1: block prompt injection and jailbreak attempts.
     matches = inspect_prompt(payload.prompt)
 
     if matches:
@@ -92,16 +93,17 @@ def proxy_prompt(
             },
         )
 
-    # Detect sensitive data without logging its actual values.
-    findings = inspect_sensitive_data(payload.prompt)
+    # Stage 2: inspect sensitive data in the incoming prompt.
+    input_findings = inspect_sensitive_data(payload.prompt)
     prompt_to_forward = payload.prompt
 
-    if findings:
+    if input_findings:
         log_event(
             "dlp_detected",
             request_id=request_id,
+            direction="input",
             mode=settings.mode,
-            findings=findings,
+            findings=input_findings,
         )
 
         if settings.mode == "block":
@@ -109,11 +111,40 @@ def proxy_prompt(
                 status_code=403,
                 detail={
                     "error": "Prompt blocked by DLP",
-                    "findings": findings,
+                    "findings": input_findings,
                 },
             )
 
         if settings.mode == "redact":
             prompt_to_forward = redact_sensitive_data(payload.prompt)
 
-    return forward_prompt(prompt_to_forward)
+    # Stage 3: send the inspected prompt to the mock LLM.
+    result = forward_prompt(prompt_to_forward)
+
+    # Stage 4: inspect the LLM response before returning it.
+    response_text = result.get("response")
+
+    if isinstance(response_text, str):
+        output_findings = inspect_output(response_text)
+
+        if output_findings:
+            log_event(
+                "output_guard_detected",
+                request_id=request_id,
+                mode=settings.mode,
+                findings=output_findings,
+            )
+
+            if settings.mode == "block":
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "LLM response blocked by output guard",
+                        "findings": output_findings,
+                    },
+                )
+
+            if settings.mode == "redact":
+                result["response"] = redact_output(response_text)
+
+    return result
