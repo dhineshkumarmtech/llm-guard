@@ -14,6 +14,7 @@ from app.dlp.detectors import (
 )
 from app.firewall.ml import classify_prompt, is_suspicious
 from app.firewall.rules import inspect_prompt
+from app.firewall.scoring import calculate_hybrid_risk
 from app.logger import log_event
 from app.output_guard import inspect_output, redact_output
 from app.proxy import forward_prompt
@@ -74,48 +75,78 @@ def proxy_prompt(
     payload: ProxyRequest,
     http_request: Request,
 ) -> dict[str, Any]:
-    """Inspect prompts and responses using layered security checks."""
+    """Inspect prompts using rules, ML, hybrid scoring, and DLP."""
     request_id = http_request.state.request_id
+    threshold = settings.risk_threshold
 
-    # Stage 1: apply the existing deterministic firewall rules.
+    # Stage 1: inspect the prompt using deterministic security rules.
     matches = inspect_prompt(payload.prompt)
 
+    # Stage 2: obtain the ML model's estimated injection probability.
+    ml_result = classify_prompt(payload.prompt)
+    ml_probability = float(ml_result["malicious_probability"])
+
+    # Stage 3: combine rule findings and the ML probability.
+    risk = calculate_hybrid_risk(matches, ml_probability)
+    risk_score = float(risk["risk_score"])
+
+    log_event(
+        "hybrid_risk_assessed",
+        request_id=request_id,
+        risk_score=risk["risk_score"],
+        risk_level=risk["risk_level"],
+        rule_finding_count=risk["rule_finding_count"],
+        ml_probability=risk["ml_probability"],
+        threshold=threshold,
+    )
+
+    # Preserve the existing deterministic rule-based blocking behavior.
     if matches:
         log_event(
             "prompt_blocked",
             request_id=request_id,
             matched_rules=matches,
+            risk_assessment=risk,
         )
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "Prompt blocked by LLM-Guard",
                 "matched_rules": matches,
+                "risk_assessment": risk,
             },
         )
 
-    # Stage 2: apply the ML classifier to less obvious attack patterns.
-    ml_result = classify_prompt(payload.prompt)
-    threshold = settings.risk_threshold
+    # Stage 4: enforce the ML check and hybrid risk threshold.
+    ml_flagged = is_suspicious(payload.prompt, threshold)
 
-    if is_suspicious(payload.prompt, threshold):
+    if ml_flagged or risk_score >= threshold:
+        if ml_flagged:
+            error_message = "Prompt blocked by ML classifier"
+            event_name = "ml_prompt_blocked"
+        else:
+            error_message = "Prompt blocked by hybrid risk score"
+            event_name = "hybrid_risk_blocked"
+
         log_event(
-            "ml_prompt_blocked",
+            event_name,
             request_id=request_id,
             predicted_label=ml_result["label"],
-            malicious_probability=ml_result["malicious_probability"],
+            malicious_probability=ml_probability,
             threshold=threshold,
+            risk_assessment=risk,
         )
         raise HTTPException(
             status_code=403,
             detail={
-                "error": "Prompt blocked by ML classifier",
+                "error": error_message,
                 "classification": ml_result,
                 "threshold": threshold,
+                "risk_assessment": risk,
             },
         )
 
-    # Stage 3: inspect sensitive data in the incoming prompt.
+    # Stage 5: detect sensitive data in the incoming prompt.
     input_findings = inspect_sensitive_data(payload.prompt)
     prompt_to_forward = payload.prompt
 
@@ -126,6 +157,7 @@ def proxy_prompt(
             direction="input",
             mode=settings.mode,
             findings=input_findings,
+            risk_assessment=risk,
         )
 
         if settings.mode == "block":
@@ -140,11 +172,11 @@ def proxy_prompt(
         if settings.mode == "redact":
             prompt_to_forward = redact_sensitive_data(payload.prompt)
 
-    # Stage 4: forward accepted input to the mock LLM.
+    # Stage 6: forward accepted input to the development mock LLM.
     result = forward_prompt(prompt_to_forward)
     response_text = result.get("response")
 
-    # Stage 5: inspect the LLM response before returning it.
+    # Stage 7: inspect the response before returning it to the client.
     if isinstance(response_text, str):
         output_findings = inspect_output(response_text)
 
@@ -154,6 +186,7 @@ def proxy_prompt(
                 request_id=request_id,
                 mode=settings.mode,
                 findings=output_findings,
+                risk_assessment=risk,
             )
 
             if settings.mode == "block":
@@ -168,4 +201,5 @@ def proxy_prompt(
             if settings.mode == "redact":
                 result["response"] = redact_output(response_text)
 
+    # Keep the existing successful response structure unchanged.
     return result
