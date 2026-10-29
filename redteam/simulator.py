@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -32,12 +33,20 @@ def load_payloads(path: Path) -> list[dict]:
     return payloads
 
 
-def run_case(base_url: str, case: dict, timeout: float = 5.0) -> dict:
+def run_case(
+    base_url: str,
+    case: dict,
+    timeout: float = 5.0,
+    api_key: str | None = None,
+) -> dict:
     """Send one test prompt and record the HTTP result."""
     request = Request(
         f"{base_url.rstrip('/')}/proxy",
         data=json.dumps({"prompt": case["prompt"]}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            **({"X-API-Key": api_key} if api_key else {}),
+        },
         method="POST",
     )
 
@@ -102,6 +111,11 @@ def main() -> None:
         default=DEFAULT_PAYLOADS,
         help="Path to the JSON test cases.",
     )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("LLM_GUARD_API_KEY"),
+        help="API key; defaults to LLM_GUARD_API_KEY environment variable.",
+    )
     args = parser.parse_args()
 
     try:
@@ -115,7 +129,7 @@ def main() -> None:
     print("-" * 65)
 
     for case in payloads:
-        result = run_case(args.url, case)
+        result = run_case(args.url, case, api_key=args.api_key)
         results.append(result)
 
         if result["error"]:

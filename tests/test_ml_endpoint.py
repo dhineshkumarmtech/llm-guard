@@ -5,7 +5,10 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-client = TestClient(app)
+client = TestClient(
+    app,
+    headers={"X-API-Key": "test-only-llm-guard-key"},
+)
 
 
 def test_ml_blocks_suspicious_prompt() -> None:

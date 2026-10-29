@@ -7,7 +7,10 @@ from app.config import settings
 from app.main import app
 
 
-client = TestClient(app)
+client = TestClient(
+    app,
+    headers={"X-API-Key": "test-only-llm-guard-key"},
+)
 
 
 def test_block_mode_rejects_sensitive_output(monkeypatch) -> None:
